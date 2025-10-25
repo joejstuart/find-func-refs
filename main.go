@@ -36,23 +36,29 @@ func main() {
 	var filePath string
 	var root string
 	var withSnippet bool
-	flag.StringVar(&filePath, "file", "", "Path to the Go source file whose declared functions/methods to search for (required)")
+	var allFiles bool
+	var includeTests bool
+	var excludeMain bool
+	flag.StringVar(&filePath, "file", "", "Path to the Go source file whose declared functions/methods to search for (required unless -all is used)")
 	flag.StringVar(&root, "root", ".", "Root directory to search (module/workspace root)")
 	flag.BoolVar(&withSnippet, "snippet", false, "Include a trimmed code line as a snippet")
+	flag.BoolVar(&allFiles, "all", false, "Process all Go source files in the codebase (excludes test files by default)")
+	flag.BoolVar(&includeTests, "include-tests", false, "Include test files when using -all")
+	flag.BoolVar(&excludeMain, "exclude-main", true, "Exclude main function from analysis (default: true)")
 	flag.Parse()
 
-	if filePath == "" {
-		fmt.Fprintln(os.Stderr, "error: -file is required")
+	if filePath == "" && !allFiles {
+		fmt.Fprintln(os.Stderr, "error: either -file or -all is required")
+		os.Exit(2)
+	}
+	if filePath != "" && allFiles {
+		fmt.Fprintln(os.Stderr, "error: cannot use both -file and -all")
 		os.Exit(2)
 	}
 
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		log.Fatalf("resolve root: %v", err)
-	}
-	absFile, err := filepath.Abs(filePath)
-	if err != nil {
-		log.Fatalf("resolve file: %v", err)
 	}
 
 	cfg := &packages.Config{
@@ -78,16 +84,57 @@ func main() {
 		log.Println("warning: some packages had errors; results may be incomplete")
 	}
 
-	// 2) Find the package that contains the target file; collect symbols declared in that file
-	targetSyms := collectFileSymbols(pkgs, absFile)
-	if len(targetSyms) == 0 {
-		log.Fatalf("no function or method declarations found in %s (did you point to the right file?)", absFile)
+	var targetSyms []symbol
+	var results map[string][]ref
+
+	if allFiles {
+		// Process all Go files in the codebase
+		allGoFiles := collectAllGoFiles(pkgs, includeTests)
+		if len(allGoFiles) == 0 {
+			log.Fatalf("no Go source files found in %s", absRoot)
+		}
+
+		// Collect symbols from all files
+		for _, file := range allGoFiles {
+			fileSyms := collectFileSymbols(pkgs, file)
+			targetSyms = append(targetSyms, fileSyms...)
+		}
+
+		if len(targetSyms) == 0 {
+			log.Fatalf("no function or method declarations found in any Go files")
+		}
+
+		// Remove duplicates and optionally exclude main
+		targetSyms = uniqueSymbols(targetSyms)
+		if excludeMain {
+			targetSyms = filterMainFunction(targetSyms)
+		}
+
+		// Search all packages for references to those symbols
+		results = findReferences(pkgs, targetSyms, withSnippet)
+	} else {
+		// Original single file mode
+		absFile, err := filepath.Abs(filePath)
+		if err != nil {
+			log.Fatalf("resolve file: %v", err)
+		}
+
+		// Find the package that contains the target file; collect symbols declared in that file
+		targetSyms = collectFileSymbols(pkgs, absFile)
+		if len(targetSyms) == 0 {
+			log.Fatalf("no function or method declarations found in %s (did you point to the right file?)", absFile)
+		}
+
+		// Optionally exclude main function
+		if excludeMain {
+			targetSyms = filterMainFunction(targetSyms)
+		}
+
+		// Search all packages for references to those symbols
+		results = findReferences(pkgs, targetSyms, withSnippet)
 	}
 
-	// 3) Search all packages for references to those symbols
-	results := findReferences(pkgs, targetSyms, withSnippet)
-
-	// 4) Print results grouped by symbol
+	// Print results grouped by symbol
 	printResults(targetSyms, results)
 }
 
@@ -141,6 +188,58 @@ func uniqueSymbols(in []symbol) []symbol {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Qualified < out[j].Qualified })
 	return out
+}
+
+// filterMainFunction removes the main function from the symbol list.
+func filterMainFunction(syms []symbol) []symbol {
+	var filtered []symbol
+	for _, s := range syms {
+		// Check if this is a main function (no receiver and name is "main")
+		if s.Obj.Name() == "main" && s.Obj.Type().(*types.Signature).Recv() == nil {
+			continue
+		}
+		filtered = append(filtered, s)
+	}
+	return filtered
+}
+
+// collectAllGoFiles returns all Go source files from the loaded packages,
+// optionally including test files.
+func collectAllGoFiles(pkgs []*packages.Package, includeTests bool) []string {
+	var files []string
+	seen := make(map[string]bool)
+
+	for _, pkg := range pkgs {
+		if pkg == nil {
+			continue
+		}
+
+		// Collect from CompiledGoFiles (non-test files)
+		for _, file := range pkg.CompiledGoFiles {
+			if absFile, err := filepath.Abs(file); err == nil {
+				if !seen[absFile] {
+					seen[absFile] = true
+					files = append(files, absFile)
+				}
+			}
+		}
+
+		// Optionally include test files
+		if includeTests {
+			for _, file := range pkg.OtherFiles {
+				if absFile, err := filepath.Abs(file); err == nil {
+					if !seen[absFile] {
+						seen[absFile] = true
+						files = append(files, absFile)
+					}
+				}
+			}
+		}
+	}
+
+	// Sort for deterministic output
+	sort.Strings(files)
+	return files
 }
 
 func qualifiedFuncName(fn *types.Func) string {
